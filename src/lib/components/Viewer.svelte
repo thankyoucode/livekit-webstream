@@ -1,176 +1,120 @@
 <script lang="ts">
 	import { onMount, onDestroy } from 'svelte';
+	import {
+		Room,
+		type Room as RoomType,
+		type RemoteParticipant,
+		type RemoteTrackPublication,
+		type RemoteTrack
+	} from 'livekit-client';
 
-	let remoteStream: MediaStream | null = null;
-	let pc: RTCPeerConnection | null = null;
-	let ws: WebSocket | null = null;
+	let room: RoomType | null = null;
 	let videoElem: HTMLVideoElement | null = null;
+	let remoteStream: MediaStream | null = null;
+	let browserReady = false;
+	let errorMsg = '';
 
-	let isConnected = false;
-	let bufferedCandidates: RTCIceCandidateInit[] = [];
+	let wsUrl: string;
 
-	// Reactive binding of stream to video element
-	$: if (videoElem) {
-		videoElem.srcObject = remoteStream;
+	onMount(() => {
+		const hostname = window.location.hostname;
+		const port = '7880'; // LiveKit default port
+
+		// Add a path if your LiveKit expects this eg: '/ws'
+		const WS_PATH = '/ws';
+		wsUrl =
+			hostname === 'localhost' || hostname === '127.0.0.1'
+				? `ws://localhost:${port}${WS_PATH}`
+				: `ws://${hostname}:${port}${WS_PATH}`;
+	});
+
+	async function fetchToken(identity = 'viewer', room = 'default-room') {
+		const res = await fetch(`/api/token?identity=${identity}&room=${room}`);
+		if (!res.ok) throw new Error('Failed to fetch token');
+		const data = await res.json();
+		return data.token;
 	}
 
-	// Cleanup connections and streams
-	function cleanup() {
-		if (pc) {
-			pc.ontrack = null;
-			pc.onicecandidate = null;
-			pc.onconnectionstatechange = null;
-			pc.oniceconnectionstatechange = null;
-			pc.close();
-			pc = null;
-		}
+	async function connect(): Promise<void> {
+		try {
+			const token = await fetchToken();
+			room = new Room();
+			remoteStream = new MediaStream();
 
-		if (ws) {
-			ws.onopen = null;
-			ws.onmessage = null;
-			ws.onerror = null;
-			ws.onclose = null;
-			ws.close();
-			ws = null;
-		}
+			room.on(
+				'trackSubscribed',
+				(
+					track: RemoteTrack,
+					publication: RemoteTrackPublication,
+					participant: RemoteParticipant
+				) => {
+					if (track.kind === 'video' && videoElem && remoteStream) {
+						remoteStream.addTrack(track.mediaStreamTrack);
+						videoElem.srcObject = remoteStream;
+					}
+				}
+			);
 
+			room.on(
+				'trackUnsubscribed',
+				(
+					track: RemoteTrack,
+					publication: RemoteTrackPublication,
+					participant: RemoteParticipant
+				) => {
+					if (remoteStream && track.mediaStreamTrack) {
+						remoteStream.removeTrack(track.mediaStreamTrack);
+						if (videoElem) {
+							videoElem.srcObject = remoteStream;
+						}
+					}
+				}
+			);
+
+			await room.connect(wsUrl, token);
+			room.remoteParticipants.forEach((participant: RemoteParticipant) => {
+				participant.trackPublications.forEach((publication: RemoteTrackPublication) => {
+					const track = publication.track;
+					if (publication.isSubscribed && track?.kind === 'video') {
+						if (remoteStream && videoElem) {
+							remoteStream.addTrack(track.mediaStreamTrack);
+							videoElem.srcObject = remoteStream;
+						}
+					}
+				});
+			});
+			errorMsg = '';
+		} catch (err) {
+			errorMsg = 'Failed to connect viewer';
+			console.error('Failed to connect viewer:', err);
+		}
+	}
+
+	async function disconnect(): Promise<void> {
+		if (room) {
+			await room.disconnect();
+			room = null;
+		}
 		if (remoteStream) {
 			remoteStream.getTracks().forEach((track) => track.stop());
 			remoteStream = null;
 		}
-
-		isConnected = false;
-		bufferedCandidates = [];
+		if (videoElem) {
+			videoElem.srcObject = null;
+		}
 	}
 
 	onMount(() => {
-		pc = new RTCPeerConnection({
-			iceServers: [] // Use empty or add STUN servers if on internet
-		});
-
-		// Debug connection state changes
-		pc.onconnectionstatechange = () => {
-			console.log('[PC] Connection state change:', pc?.connectionState);
-			if (pc?.connectionState === 'failed' || pc?.connectionState === 'disconnected') {
-				cleanup();
-			}
-		};
-
-		// Debug ICE connection state changes
-		pc.oniceconnectionstatechange = () => {
-			console.log('[PC] ICE connection state:', pc?.iceConnectionState);
-			if (pc?.iceConnectionState === 'failed' || pc?.iceConnectionState === 'disconnected') {
-				cleanup();
-			}
-		};
-
-		// When remote track arrives, update remoteStream
-		pc.ontrack = (event) => {
-			console.log('[PC] Track event:', event);
-			// Assign latest stream — this triggers videoElem.srcObject update
-			remoteStream = event.streams[0];
-		};
-
-		// Send ICE candidates to signaling server
-		pc.onicecandidate = (event) => {
-			if (event.candidate && ws?.readyState === WebSocket.OPEN) {
-				ws.send(JSON.stringify({ type: 'candidate', candidate: event.candidate }));
-			}
-		};
-
-		ws = new WebSocket(`ws://${location.hostname}:8080`);
-
-		ws.onopen = () => {
-			if (ws) {
-				console.log('[WS] Connected as viewer');
-				ws.send(JSON.stringify({ type: 'viewer' }));
-				isConnected = true;
-			}
-		};
-
-		ws.onmessage = async (event) => {
-			try {
-				const message = JSON.parse(event.data);
-				console.log('[WS] Message received:', message);
-
-				switch (message.type) {
-					case 'viewer-ack':
-						// Server confirms viewer registered
-						console.log('Viewer connection acknowledged');
-						// Update UI or internal state here if needed
-						break;
-
-					case 'offer':
-						if (pc && ws) {
-							// Remote SDP offer from streamer
-							await pc.setRemoteDescription(new RTCSessionDescription(message.offer));
-							// Create and set local answer SDP
-							const answer = await pc.createAnswer();
-							await pc.setLocalDescription(answer);
-							// Send answer back via server to streamer
-							ws.send(JSON.stringify({ type: 'answer', answer }));
-
-							// Add buffered ICE candidates after setting remote description
-							for (const candidate of bufferedCandidates) {
-								await pc.addIceCandidate(new RTCIceCandidate(candidate));
-							}
-							bufferedCandidates = [];
-						}
-						break;
-
-					case 'candidate':
-						if (pc) {
-							if (pc.remoteDescription) {
-								try {
-									await pc.addIceCandidate(new RTCIceCandidate(message.candidate));
-								} catch (e) {
-									console.error('[PC] Error adding ICE candidate:', e);
-								}
-							} else {
-								bufferedCandidates.push(message.candidate);
-							}
-						}
-						break;
-
-					case 'broadcaster-closed':
-						console.log('[WS] Broadcaster closed');
-						cleanup(); // Implement cleanup to stop stream, release resources
-						break;
-
-					default:
-						console.warn('[WS] Unknown message type:', message.type);
-				}
-			} catch (err) {
-				console.error('[WS] Error handling message:', err);
-			}
-		};
-
-		ws.onerror = (err) => {
-			console.error('[WS] WebSocket error:', err);
-		};
-
-		ws.onclose = () => {
-			console.log('[WS] Disconnected');
-			cleanup();
-		};
+		browserReady = true;
+		connect();
 	});
 
 	onDestroy(() => {
-		cleanup();
+		disconnect();
 	});
 </script>
 
-<div class="flex flex-col items-center justify-center h-screen bg-[#121212] text-white p-4">
-	<div
-		class="bg-black rounded-lg shadow-2xl max-w-[90vw] max-h-[80vh] w-full aspect-video overflow-hidden flex items-center justify-center"
-	>
-		<video
-			autoplay
-			playsinline
-			muted
-			bind:this={videoElem}
-			class="w-full h-full object-contain rounded-lg"
-		></video>
-	</div>
-	<p class="mt-4 text-gray-400">{remoteStream ? 'Live Stream' : 'Waiting for broadcaster...'}</p>
+<div class="fixed inset-0 bg-black">
+	<video autoplay playsinline muted bind:this={videoElem} class="w-full h-full object-contain"
+	></video>
 </div>

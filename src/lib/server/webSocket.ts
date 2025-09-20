@@ -1,3 +1,21 @@
+/**
+ * Deprecated: Custom WebSocket Implementation
+ *
+ * This file previously contained a custom WebSocket server
+ * for managing one-to-one or one-to-many connections.
+ *
+ * We no longer use this approach, since maintaining connection logic,
+ * scaling, and broadcasting was complex and inefficient.
+ *
+ * Replaced by:
+ * - LiveKit (direct integration) which provides a more powerful
+ *   and production-ready real-time communication framework.
+ *
+ * Note:
+ * - This file remains here for historical context only.
+ * - Do not use it in new development.
+ */
+
 import { WebSocketServer, WebSocket } from 'ws';
 import http from 'http';
 
@@ -42,48 +60,28 @@ export function createWebSocketServer(httpServer: http.Server) {
 					console.log('Viewer connected, total:', viewers.size);
 					break;
 
-				case 'offer':
-					// Relay streamer offer to all viewers
-					viewers.forEach((viewer) => {
-						if (viewer.readyState === WebSocket.OPEN) {
-							viewer.send(JSON.stringify(msg));
-						}
-					});
-					break;
-
-				case 'answer':
-					// Relay viewer answer to streamer
-					if (streamer && streamer.readyState === WebSocket.OPEN) {
-						streamer.send(JSON.stringify(msg));
-					}
-					break;
-
-				case 'candidate':
-					// Relay ICE candidates appropriately
-					if (streamer === ws) {
-						// From streamer to viewers
+				default:
+					// If message comes from streamer, broadcast to all viewers
+					if (ws === streamer) {
 						viewers.forEach((viewer) => {
 							if (viewer.readyState === WebSocket.OPEN) {
-								viewer.send(JSON.stringify(msg));
+								viewer.send(data);
 							}
 						});
 					} else {
-						// From viewer to streamer
+						// If message comes from a viewer, send only to streamer
 						if (streamer && streamer.readyState === WebSocket.OPEN) {
-							streamer.send(JSON.stringify(msg));
+							streamer.send(data);
 						}
 					}
 					break;
-
-				default:
-					ws.send(JSON.stringify({ error: 'Unknown message type' }));
 			}
 		});
 
 		ws.on('close', () => {
 			if (ws === streamer) {
 				streamer = null;
-				// Notify all viewers that broadcaster closed
+				// Notify viewers streamer closed
 				viewers.forEach((viewer) => {
 					if (viewer.readyState === WebSocket.OPEN) {
 						viewer.send(JSON.stringify({ type: 'broadcaster-closed' }));
@@ -102,6 +100,5 @@ export function createWebSocketServer(httpServer: http.Server) {
 	});
 
 	console.log('WebSocket signaling server running');
-
 	return wss;
 }

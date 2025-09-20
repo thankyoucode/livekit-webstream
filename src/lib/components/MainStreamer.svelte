@@ -1,220 +1,124 @@
 <script lang="ts">
-	import { onMount, onDestroy } from 'svelte';
+	import { onDestroy, onMount } from 'svelte';
+	import type { Room as RoomType, LocalVideoTrack } from 'livekit-client';
+	import { Room, createLocalScreenTracks } from 'livekit-client';
 
-	let remoteStream: MediaStream | null = null;
-	let pc: RTCPeerConnection | null = null;
-	let ws: WebSocket | null = null;
+	let room: RoomType | null = null;
+	let localTrack: LocalVideoTrack | null = null;
 	let videoElem: HTMLVideoElement | null = null;
-
 	let isStreaming = false;
-	let isPreviewing = false;
-	let localStream: MediaStream | null = null;
-	let bufferedCandidates: RTCIceCandidateInit[] = [];
+	let viewerCount = 0;
 
-	// Bind remoteStream to video element srcObject reactively
-	$: if (videoElem) {
-		videoElem.srcObject = remoteStream;
-	}
+	let wsUrl: string;
 
-	// Start local screen capture preview
-	async function startPreview() {
-		if (isPreviewing) return;
-
-		try {
-			localStream = await (navigator.mediaDevices as any).getDisplayMedia({
-				video: true,
-				audio: false
-			});
-
-			remoteStream = localStream;
-			isPreviewing = true;
-
-			// Add tracks immediately after preview start for better flow
-			if (pc && localStream) {
-				localStream.getTracks().forEach((track) => pc!.addTrack(track, localStream!));
-			}
-		} catch (error) {
-			console.error('Could not start preview:', error);
-			alert('Failed to start screen preview. Please allow screen sharing.');
-		}
-	}
-
-	// Start streaming process, create offer and send via WS
-	async function startStreaming(): Promise<void> {
-		if (!isPreviewing || isStreaming || !pc || !ws || !localStream) return;
-
-		isStreaming = true;
-
-		try {
-			// Create offer after tracks already added (should already be via startPreview)
-			const offer = await pc.createOffer();
-			await pc.setLocalDescription(offer);
-
-			if (ws.readyState === WebSocket.OPEN) {
-				ws.send(JSON.stringify({ type: 'offer', offer }));
-			} else {
-				throw new Error('WebSocket is not open.');
-			}
-		} catch (error) {
-			console.error('Error during streaming start:', error);
-			isStreaming = false;
-		}
-	}
-
-	// Stop streaming and clean up resources
-	function stopStreaming(): void {
-		if (pc) {
-			pc.getSenders().forEach((sender) => sender.track?.stop());
-			pc.close();
-			pc = null;
-		}
-
-		if (localStream) {
-			localStream.getTracks().forEach((track) => track.stop());
-			localStream = null;
-		}
-
-		if (videoElem) {
-			videoElem.srcObject = null;
-		}
-
-		if (ws) {
-			ws.close();
-			ws = null;
-		}
-
-		remoteStream = null;
-		isStreaming = false;
-		isPreviewing = false;
-		bufferedCandidates = [];
-	}
-
-	// Initialize WebRTC peer connection and signaling WS on component mount
 	onMount(() => {
-		pc = new RTCPeerConnection({
-			iceServers: [] // Empty for LAN/offline, or add STUN/TURN as needed
-		});
+		const hostname = window.location.hostname;
+		const port = '7880'; // LiveKit default port
 
-		pc.onicecandidate = (event) => {
-			if (event.candidate && ws?.readyState === WebSocket.OPEN) {
-				ws.send(JSON.stringify({ type: 'candidate', candidate: event.candidate }));
-			}
-		};
-
-		pc.onconnectionstatechange = () => {
-			console.log('[PC] connectionState:', pc?.connectionState);
-			if (pc?.connectionState === 'failed' || pc?.connectionState === 'disconnected') {
-				stopStreaming();
-			}
-		};
-
-		ws = new WebSocket(`ws://${location.hostname}:8080`);
-
-		ws.onopen = () => {
-			if (ws) {
-				ws.send(JSON.stringify({ type: 'streamer' }));
-				console.log('[WS] Signaling connection opened as streamer');
-			} else {
-				console.log('[WS] Is not find');
-			}
-		};
-
-		ws.onmessage = async (event) => {
-			try {
-				const message = JSON.parse(event.data);
-
-				switch (message.type) {
-					case 'streamer-ack':
-						console.log('Streamer connection acknowledged');
-						break;
-
-					case 'answer':
-						if (!pc) return;
-						await pc.setRemoteDescription(new RTCSessionDescription(message.answer));
-
-						for (const candidate of bufferedCandidates) {
-							await pc.addIceCandidate(new RTCIceCandidate(candidate));
-						}
-						bufferedCandidates = [];
-						break;
-
-					case 'candidate':
-						if (!pc) return;
-
-						if (pc.remoteDescription) {
-							try {
-								await pc.addIceCandidate(new RTCIceCandidate(message.candidate));
-							} catch (error) {
-								console.error('[PC] Error adding ICE candidate:', error);
-							}
-						} else {
-							bufferedCandidates.push(message.candidate);
-						}
-						break;
-
-					case 'broadcaster-closed':
-						console.log('[WS] Received broadcaster-closed message');
-						stopStreaming();
-						break;
-
-					default:
-						console.warn('[WS] Unknown message type:', message.type);
-				}
-			} catch (error) {
-				console.error('[WS] Error parsing message:', error);
-			}
-		};
-
-		ws.onerror = (event) => {
-			console.error('[WS] WebSocket error:', event);
-		};
-
-		ws.onclose = () => {
-			console.log('[WS] WebSocket connection closed');
-			stopStreaming();
-		};
+		// Add a path if your LiveKit expects this eg: '/ws'
+		const WS_PATH = '/ws';
+		wsUrl =
+			hostname === 'localhost' || hostname === '127.0.0.1'
+				? `ws://localhost:${port}${WS_PATH}`
+				: `ws://${hostname}:${port}${WS_PATH}`;
 	});
 
-	// Cleanup on component unload
+	async function fetchToken(identity = 'streamer123', room = 'default-room'): Promise<string> {
+		const res = await fetch(`/api/token?identity=${identity}&room=${room}`);
+		if (!res.ok) {
+			const errMsg = await res.text();
+			throw new Error(`Token fetch failed: ${errMsg}`);
+		}
+		const data = await res.json();
+		if (!data.token) throw new Error('No token received from server');
+		return data.token;
+	}
+
+	async function startStreaming(): Promise<void> {
+		if (isStreaming) return;
+		try {
+			const screenTracks = await createLocalScreenTracks({ audio: false });
+			localTrack = screenTracks[0] as LocalVideoTrack;
+			if (videoElem && localTrack.mediaStreamTrack) {
+				if (!navigator.mediaDevices || !navigator.mediaDevices.getDisplayMedia) {
+					alert('Your browser does not support mediaDevices API or secure context is required.');
+					return;
+				}
+				videoElem.srcObject = new MediaStream([localTrack.mediaStreamTrack]);
+			}
+			room = new Room();
+			const token = await fetchToken();
+			await room.connect(wsUrl, token);
+			await room.localParticipant.publishTrack(localTrack);
+
+			room.on('disconnected', () => {
+				isStreaming = false;
+			});
+
+			// Example viewer count subscriptions:
+			room.on('participantConnected', () => {
+				viewerCount = room!.remoteParticipants.size;
+			});
+			room.on('participantDisconnected', () => {
+				viewerCount = room!.remoteParticipants.size;
+			});
+
+			isStreaming = true;
+		} catch (err) {
+			console.error('Streaming error:', err);
+			await stopStreaming();
+		}
+	}
+
+	async function stopStreaming(): Promise<void> {
+		if (room) {
+			await room.disconnect();
+			room = null;
+		}
+		if (localTrack) {
+			localTrack.stop();
+			localTrack = null;
+		}
+		isStreaming = false;
+		viewerCount = 0;
+		if (videoElem) videoElem.srcObject = null;
+	}
+
 	onDestroy(() => {
 		stopStreaming();
 	});
 </script>
 
-<div class="flex flex-col h-screen bg-[#1e1e1e] text-white font-sans">
-	<div class="flex-1 relative bg-black">
-		<video autoplay muted playsinline class="w-full h-full object-cover" bind:this={videoElem}
-		></video>
-	</div>
+<div class="relative w-screen h-screen bg-black overflow-hidden text-white">
+	<video
+		autoplay
+		muted
+		playsinline
+		bind:this={videoElem}
+		class="absolute inset-0 w-full h-full object-cover"
+	></video>
 
 	<div
-		class="flex items-center justify-center bg-[#2c2c2c] border-t border-[#333] p-3 select-none"
-		style="min-height: 60px;"
+		class="absolute bottom-6 left-1/2 transform -translate-x-1/2 flex items-center gap-6 bg-opacity-70 backdrop-blur-md rounded-full px-6 py-2 max-w-xs w-fit text-gray-300 text-sm select-none"
 	>
-		{#if !isPreviewing && !isStreaming}
+		{#if !isStreaming}
 			<button
-				on:click={startPreview}
-				class="rounded-full bg-green-500 hover:bg-green-600 px-6 py-2 text-sm font-semibold transition-colors"
-				aria-label="Preview Screen"
-			>
-				Preview
-			</button>
-		{:else if isPreviewing && !isStreaming}
-			<button
+				class="bg-[#111] border border-[#444] rounded-full px-5 py-2 hover:bg-[#222] transition"
 				on:click={startStreaming}
-				class="rounded-full bg-green-500 hover:bg-green-600 px-6 py-2 text-sm font-semibold transition-colors"
 				aria-label="Start Streaming"
 			>
-				Start Streaming
+				Start
 			</button>
-		{:else if isStreaming}
+		{:else}
 			<button
+				class="bg-[#111] border border-[#444] rounded-full px-5 py-2 hover:bg-[#222] transition"
 				on:click={stopStreaming}
-				class="rounded-full bg-red-600 hover:bg-red-700 px-6 py-2 text-sm font-semibold transition-colors"
 				aria-label="Stop Streaming"
 			>
 				Stop
 			</button>
 		{/if}
+
+		<span>{viewerCount} {viewerCount === 1 ? 'viewer' : 'viewers'}</span>
 	</div>
 </div>

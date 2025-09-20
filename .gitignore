@@ -1,6 +1,7 @@
+# Dependencies
 node_modules
 
-# Output
+# Build output
 .output
 .vercel
 .netlify
@@ -9,16 +10,32 @@ node_modules
 /build
 /Document
 
-# OS
+# OS files
 .DS_Store
 Thumbs.db
 
-# Env
+# Environment files
 .env
 .env.*
 !.env.example
 !.env.test
-
-# Vite
+# Vite temporary files
 vite.config.js.timestamp-*
 vite.config.ts.timestamp-*
+
+# Certificates / Keys
+*.pem
+*.key
+
+.livekitpid
+# Logs
+npm-debug.log*
+yarn-debug.log*
+yarn-error.log*
+pnpm-debug.log*
+
+# Misc
+*.log
+
+# Runtime / Temp files
+.livekit_pid
